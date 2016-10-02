@@ -1,7 +1,9 @@
+extern crate webp_sys;
 extern crate rscam;
 extern crate time;
 extern crate byteorder;
-// extern crate image;
+extern crate fallocate;
+extern crate surface;
 
 use std::env;
 use std::fs;
@@ -10,15 +12,32 @@ use std::sync::Arc;
 use std::sync::mpsc::channel;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use byteorder::{WriteBytesExt, BigEndian};
-// use image::{
-//     ImageResult,
-//     ImageFormat,
-//     FilterType,
-// };
+use std::collections::VecDeque;
+use std::sync::mpsc::sync_channel;
+use std::thread;
+
+use surface::{Surface, Luma, Yuv420p, Yuv422p, Yuv422};
+use surface::kernels::{Luma8Sobel3x3, Luma8Average3x3};
+
+mod webp;
+mod compose;
+mod conversions;
+mod punchcat;
+
+use self::punchcat::PunchCat;
+use self::conversions::{
+    yuyv_interleave_to_yuv422p,
+    downsample_yuyv_420p,
+};
+use self::compose::{compose, ComposeMode};
 
 const PREAMBLE: &'static [u8] = &[0x98, 0x56, 0xcb, 0x6b, 0x56, 0xf8, 0xc8, 0x15];
 
 fn main() {
+    const WIDTH: u32 = 1280;
+    const HEIGHT: u32 = 960;
+    const LIT_HISTORY_MAX: usize = 3;
+
     let ctr = Arc::new(AtomicIsize::new(0));
 
     let video_dev = env::args().nth(1).unwrap();
@@ -27,67 +46,190 @@ fn main() {
     let mut camera = rscam::new(&video_dev).unwrap();
 
     camera.start(&rscam::Config {
-        interval: (1, 5),      // 30 fps.
-        resolution: (1280, 960),
-        format: b"MJPG",
+        interval: (1, 5),      // 5 fps.
+        resolution: (WIDTH, HEIGHT),
+        format: b"YUYV",
         ..Default::default()
-    }).unwrap();
+    }).expect("camera open fail");
 
     let now = time::get_time();
-    let filename_fs = format!("{}_{}.{:09}_fs.fmjpg", prefix, now.sec, now.nsec);
-    let filename_sc = format!("{}_{}.{:09}_sc.fmjpg", prefix, now.sec, now.nsec);
 
+
+    let filename_fs = format!("{}_{}.{:09}_fs.fwebp", prefix, now.sec, now.nsec);
     println!("writing fullsize to {}", filename_fs);
-    println!("writing scaled to {}", filename_sc);
 
+    let filename_yuv = format!("{}_{}.{:09}.yuv422p", prefix, now.sec, now.nsec);
+    println!("writing raw to {} | interval = {}", filename_yuv, 2 * WIDTH * HEIGHT);
+
+    let filename_edge = format!("{}_{}.{:09}.edge.yuv420p", prefix, now.sec, now.nsec);
+    println!("writing raw to {} | interval = {}", filename_edge, 3 * WIDTH * HEIGHT / 2);
+
+    let mut mctx = MotionContext::new(WIDTH, HEIGHT);
     let mut frameout_fs = fs::File::create(&filename_fs).unwrap();
-    // let mut frameout_sc = fs::File::create(&filename_sc).unwrap();
+    let mut frameout_edge = PunchCat::new(27, 26, fs::File::create(&filename_edge).unwrap());
+    let mut frameout_yuv = PunchCat::new(27, 26, fs::File::create(&filename_yuv).unwrap());
 
-    // let (tx, rx) = channel::<(time::Timespec, rscam::Frame)>();
-    // let tcode_ctr = ctr.clone();
-    // let transcode = ::std::thread::spawn(move || {
-    //     for (frame_when, frame) in rx {
-    //         tcode_ctr.fetch_sub(1, Ordering::SeqCst);
-    //         if let Ok(smaller_frame) = rescale(&frame[..]) {
+    let (tx, rx) = sync_channel(10);
+    let camera_thread = thread::spawn(move || {
+        for i in 0_u64.. {
+            let frame_when = time::get_time();
 
-    //             frameout_sc.write_all(PREAMBLE).unwrap();
-    //             frameout_sc.write_i64::<BigEndian>(frame_when.sec).unwrap();
-    //             frameout_sc.write_i32::<BigEndian>(frame_when.nsec).unwrap();
-    //             frameout_sc.write_u32::<BigEndian>(smaller_frame.len() as u32).unwrap();
-    //             frameout_sc.write_all(&smaller_frame[..]).unwrap();
-    //             println!("emit compressed frame");
-    //         }
-    //     }
-    // });
+            let frame_data = camera.capture().unwrap().to_vec().into_boxed_slice();
+            let surf = Surface::<Yuv422, u8, _>::new(WIDTH, HEIGHT, frame_data);
+            tx.send((i, frame_when, surf)).unwrap();
+        }
+    });
 
-    for i in 0_u64.. {
-        let frame_when = time::get_time();
-        let frame = camera.capture().unwrap();
-        let frame_len = frame.len();
 
-        frameout_fs.write_all(PREAMBLE).unwrap();
-        frameout_fs.write_i64::<BigEndian>(frame_when.sec).unwrap();
-        frameout_fs.write_i32::<BigEndian>(frame_when.nsec).unwrap();
-        frameout_fs.write_u32::<BigEndian>(frame.len() as u32).unwrap();
-        frameout_fs.write_all(&frame[..]).unwrap();
+    let mut out_surf = Surface::<Yuv422p, u8, _>::new_black(WIDTH, HEIGHT);
+    for (i, frame_when, surf) in rx {
+        yuyv_interleave_to_yuv422p(&surf, &mut out_surf);
+        frameout_yuv.write_all(out_surf.raw_bytes()).unwrap();
 
-        // let ctr_val = ctr.fetch_add(1, Ordering::SeqCst);
-        // if 5 < ctr_val {
-        //     println!("Transcode is falling behind.");
-        // }
-        // if let Err(err) = tx.send((frame_when, frame)) {
-        //     println!("Transcode TX failure: {}", err);
-        // }
-        println!("emit F#{:010} @{}.{:09} len={}", i, frame_when.sec, frame_when.nsec, frame_len);
+        let surf_ds = downsample_yuyv_420p(&surf);
+        if let Some(emit_surf) = mctx.push_pop(surf_ds) {
+            let tcode_st = time::get_time();
+            let webp = webp::reencode(&emit_surf);
+            println!("transcode time: {}", time::get_time() - tcode_st);
+
+            frameout_fs.write_all(PREAMBLE).unwrap();
+            frameout_fs.write_i64::<BigEndian>(frame_when.sec).unwrap();
+            frameout_fs.write_i32::<BigEndian>(frame_when.nsec).unwrap();
+            frameout_fs.write_u32::<BigEndian>(webp.len() as u32).unwrap();
+            frameout_fs.write_all(&webp[..]).unwrap();
+
+            println!("emit F#{:010} @{}.{:09} len={}", i, frame_when.sec, frame_when.nsec, webp.len());
+        }
+
+        write_lumasurface_yuv420p(&mut frameout_edge, &mctx.last_edge).unwrap();
     }
 
-    // drop(transcode);
+    camera_thread.join().unwrap();
+
+    // let mut out = io::stdout();
+
+    // let mut denoise_avg = LumaSurface::new_black(WIDTH, HEIGHT);
+    // let mut channel_y = vec![0; (WIDTH * HEIGHT) as usize];
+    // let mut discard_u = vec![0; (WIDTH * HEIGHT / 2) as usize];
+    // let mut discard_v = vec![0; (WIDTH * HEIGHT / 2) as usize];
+
+
+    // let mut mctx = MotionContext::new(WIDTH, HEIGHT);
+    // for i in 0_u64.. {
+    //     while recents.len() > LIT_HISTORY_MAX {
+    //         recents.pop_front().unwrap();
+    //     }
+
+    //     let frame = camera.capture().expect("camera frame get fail");
+    //     let surf = Yuv420pSurface::from_yuyv_buf(WIDTH, HEIGHT, &frame[..]);
+
+    //     if let Some(frame) = mctx.push_pop(surf) {
+
+    //     }
+
+    //     yuyv_interleave_to_yuv422p(&frame[..], &mut channel_y, &mut discard_u, &mut discard_v);
+
+    //     let luma = LumaSurface::new(WIDTH, HEIGHT, &channel_y);
+
+        
+    //     let new_edge = compose(&denoise_avg, &edge, ComposeMode::AbsoluteDiff);
+    //     denoise_avg = edge.unborrow(); // compose(&denoise_avg, &edge, ComposeMode::AverageLeftWeight);
+
+
+
+    //     if recents.len() * 100 < recents.iter().sum() {
+    //         emit_ctr = 12;
+    //     }
+
+    //     // write!(&mut io::stderr(), "frame len {}", frame.len()).unwrap();
+    //     // let newframe = webp::downsample_yuyv_420p(&frame[..]);
+    //     if 0 < emit_ctr {
+    //         write!(&mut io::stderr(), "LIT AF ({}): emitting\n", lit_pixels).unwrap();
+    //         write_lumasurface_yuv420p(&mut out, &new_edge).unwrap();
+    //         out.flush().unwrap();
+    //         emit_ctr -= 1;
+    //     }
+    // }
 }
 
+// cargo run --release | mpv /dev/stdin --demuxer=rawvideo --demuxer-rawvideo=w=1280:h=960
+// ffmpeg -f rawvideo -video_size 1280x960 -framerate 5 /dev/stdin foo.webm
 
-// fn rescale(buf: &[u8]) -> ImageResult<Vec<u8>> {
-//     let image = try!(image::load_from_memory(buf));
-//     let mut out = io::Cursor::new(Vec::with_capacity(512 * 1024));
-//     try!(image.resize(640, 480, FilterType::Lanczos3).save(&mut out, ImageFormat::JPEG));
-//     Ok(out.into_inner())
-// }
+
+struct MotionContext {
+    denoise_avg: Surface<Luma, u8, Box<[u8]>>,
+    last_edge: Surface<Luma, u8, Box<[u8]>>,
+    recents: VecDeque<(usize, Surface<Yuv420p, u8, Box<[u8]>>)>,
+    emit_ctr: usize,
+    back_window: usize,
+}
+
+impl MotionContext {
+    pub fn new(width: u32, height: u32) -> MotionContext {
+        MotionContext {
+            denoise_avg: Surface::new_black(width, height),
+            last_edge: Surface::new_black(width, height),
+            recents: VecDeque::new(),
+            emit_ctr: 0,
+            back_window: 10,
+        }
+    }
+
+    //
+    pub fn push_pop(&mut self, frame: Surface<Yuv420p, u8, Box<[u8]>>)
+        -> Option<Surface<Yuv420p, u8, Box<[u8]>>>
+    {
+        let edge = {
+            let (y_p, _, _) = frame.get_planes();
+            let frame_luma = Surface::<Luma, u8, _>::new(frame.width(), frame.height(), y_p);
+
+            let mut tmp = Surface::<Luma, u8, _>::new_black(frame.width(), frame.height());
+            frame_luma.run_kernel_3x3(&Luma8Average3x3, &mut tmp);
+
+            let mut edge = Surface::<Luma, u8, _>::new_black(frame.width(), frame.height());
+            tmp.run_kernel_3x3(&Luma8Sobel3x3, &mut edge);
+
+            edge
+        };
+
+        self.last_edge = compose(&self.denoise_avg, &edge, ComposeMode::AbsoluteDiff);
+        self.denoise_avg = edge;
+
+        let mut lit_pixels = 0;
+        let mut max_val = 0;
+        for px in self.last_edge.raw_bytes() {
+            max_val = ::std::cmp::max(max_val, *px);
+            if 0x60 < *px {
+                lit_pixels += 1;
+            }
+        }
+
+        self.recents.push_back((lit_pixels, frame));
+
+        let mut emit_frame = None;
+        if self.recents.len() > self.back_window {
+            let (_lit_px, surf) = self.recents.pop_front().unwrap();
+            emit_frame = Some(surf);
+        }
+
+        if self.recents.len() * 100 < self.recents.iter().map(|&(v, _)| v).sum() {
+            self.emit_ctr = 12;
+        }
+        if self.emit_ctr > 0 {
+            self.emit_ctr -= 1;
+            return emit_frame;
+        }
+        return None;
+    }
+}
+
+fn write_lumasurface_yuv420p<W: Write>(wri: &mut W, surf: &Surface<Luma, u8, Box<[u8]>>) -> io::Result<()> {
+    let (width, height) = (surf.width() as usize, surf.height() as usize);
+
+    let chroma_hack = vec![0x80; width * height / 4];   
+    try!(wri.write_all(surf.raw_bytes()));
+    try!(wri.write_all(&chroma_hack[..]));
+    try!(wri.write_all(&chroma_hack[..]));
+
+    Ok(())
+}

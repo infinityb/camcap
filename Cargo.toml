@@ -7,4 +7,12 @@ authors = ["Stacey Ell <stacey.ell@gmail.com>"]
 time = "0.1.35"
 rscam = "0.5.3"
 byteorder = "0.5.3"
-# image = "*"
+
+[dependencies."webp-sys"]
+path = "/home/sell/dev/webp-sys/webp-sys"
+
+[dependencies.fallocate]
+path = "/home/sell/dev/lowlevel/fallocate"
+
+[dependencies.surface]
+git = "http://github.com/infinityb/surface"
