@@ -80,7 +80,6 @@ fn main() {
         }
     });
 
-
     let mut out_surf = Surface::<Yuv422p, u8, _>::new_black(WIDTH, HEIGHT);
     for (i, frame_when, surf) in rx {
         yuyv_interleave_to_yuv422p(&surf, &mut out_surf);
@@ -105,51 +104,6 @@ fn main() {
     }
 
     camera_thread.join().unwrap();
-
-    // let mut out = io::stdout();
-
-    // let mut denoise_avg = LumaSurface::new_black(WIDTH, HEIGHT);
-    // let mut channel_y = vec![0; (WIDTH * HEIGHT) as usize];
-    // let mut discard_u = vec![0; (WIDTH * HEIGHT / 2) as usize];
-    // let mut discard_v = vec![0; (WIDTH * HEIGHT / 2) as usize];
-
-
-    // let mut mctx = MotionContext::new(WIDTH, HEIGHT);
-    // for i in 0_u64.. {
-    //     while recents.len() > LIT_HISTORY_MAX {
-    //         recents.pop_front().unwrap();
-    //     }
-
-    //     let frame = camera.capture().expect("camera frame get fail");
-    //     let surf = Yuv420pSurface::from_yuyv_buf(WIDTH, HEIGHT, &frame[..]);
-
-    //     if let Some(frame) = mctx.push_pop(surf) {
-
-    //     }
-
-    //     yuyv_interleave_to_yuv422p(&frame[..], &mut channel_y, &mut discard_u, &mut discard_v);
-
-    //     let luma = LumaSurface::new(WIDTH, HEIGHT, &channel_y);
-
-        
-    //     let new_edge = compose(&denoise_avg, &edge, ComposeMode::AbsoluteDiff);
-    //     denoise_avg = edge.unborrow(); // compose(&denoise_avg, &edge, ComposeMode::AverageLeftWeight);
-
-
-
-    //     if recents.len() * 100 < recents.iter().sum() {
-    //         emit_ctr = 12;
-    //     }
-
-    //     // write!(&mut io::stderr(), "frame len {}", frame.len()).unwrap();
-    //     // let newframe = webp::downsample_yuyv_420p(&frame[..]);
-    //     if 0 < emit_ctr {
-    //         write!(&mut io::stderr(), "LIT AF ({}): emitting\n", lit_pixels).unwrap();
-    //         write_lumasurface_yuv420p(&mut out, &new_edge).unwrap();
-    //         out.flush().unwrap();
-    //         emit_ctr -= 1;
-    //     }
-    // }
 }
 
 // cargo run --release | mpv /dev/stdin --demuxer=rawvideo --demuxer-rawvideo=w=1280:h=960

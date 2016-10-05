@@ -44,7 +44,6 @@ pub fn yuyv_interleave_to_yuv422p<S1, S2>(
     assert_eq!(subpixel_ctr, from.raw_bytes().len());
 }
 
-
 pub fn yuv422p_from_buffer_mut(px_count: usize, buffer: &mut [u8])
 -> (&mut [u8], &mut [u8], &mut [u8])
 {
